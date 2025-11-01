@@ -1,0 +1,1282 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use App\Models\Room;
+use App\Models\ScheduleEntry;
+use App\Models\ScheduleGroup;
+use App\Models\Instructor;
+use App\Models\Subject;
+use App\Models\Section;
+use App\Models\ScheduleMeeting;
+use App\Models\InstructorQualification;
+use App\Models\SubjectOffering;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use DateTime;
+use Exception;
+
+class AutomateScheduleController extends Controller
+{
+    private function resolveInstructorId(string $name): int
+    {
+        return Instructor::firstOrCreate(['name' => $name])->instructor_id;
+    }
+
+    private function resolveSubjectId(string $code, string $description = null, int $units = null): int
+    {
+        $attributes = ['description' => $description ?? $code, 'units' => $units ?? 0];
+        return Subject::firstOrCreate(['code' => $code], $attributes)->subject_id;
+    }
+
+    private function resolveSectionId(string $department, string $yearLevel, string $block): int
+    {
+        // Backwards-compat: if a caller still passes year+block, keep working
+        $section = trim($yearLevel . ' ' . $block);
+        return $this->resolveSectionIdBySection($department, $section);
+    }
+
+    private function resolveSectionIdBySection(string $department, string $section): int
+    {
+        $normalizedSection = trim(preg_replace('/\s+/', ' ', $section));
+        $code = trim($department) . '-' . $normalizedSection;
+
+        // Try to extract numeric year level for the column
+        $yearLevelInt = 0;
+        if (preg_match('/(\d+)/', $normalizedSection, $m)) {
+            $yearLevelInt = (int)$m[1];
+        } else if (preg_match('/\b(I{1,3}|IV|V)\b/i', $normalizedSection, $m)) {
+            $roman = strtoupper($m[1]);
+            $map = ['I'=>1,'II'=>2,'III'=>3,'IV'=>4,'V'=>5];
+            $yearLevelInt = $map[$roman] ?? 0;
+        }
+
+        return Section::firstOrCreate([
+            'code' => $code
+        ], [
+            'year_level' => $yearLevelInt,
+            'department' => $department,
+        ])->section_id;
+    }
+
+    /**
+     * Parse a combined section string and return [yearLevel, block].
+     * Accepts variants like "BSBA-4th Year A", "4th Year A", or "3rd Year".
+     */
+    private function parseSectionParts(?string $section): array
+    {
+        $section = trim((string)($section ?? ''));
+        if ($section === '') {
+            return ['', ''];
+        }
+
+        // Remove optional department prefix before '-'
+        $parts = explode('-', $section, 2);
+        $candidate = trim(end($parts));
+
+        // Match "4th Year A" or "IV Year B"
+        if (preg_match('/^(?P<year>(?:\d+(?:st|nd|rd|th)|I{1,3}|IV|V)\s+Year)\s*(?P<block>[A-Z])?$/i', $candidate, $m)) {
+            $yearLevel = $m['year'];
+            $block = isset($m['block']) ? strtoupper($m['block']) : '';
+            return [$yearLevel, $block];
+        }
+
+        // If it already looks like just a block letter, no year present
+        if (preg_match('/^[A-Z]$/', $candidate)) {
+            return ['', strtoupper($candidate)];
+        }
+
+        return ['', ''];
+    }
+
+    /**
+     * Pick an available room id from DB set, respecting time conflicts and preferring Python suggestion.
+     */
+    private function pickAvailableRoomId(int $groupId, string $day, string $startTime, string $endTime, array $rooms, $preferredRoomId = null, array &$roomUsage = [], array &$roomDayUsage = [], int &$rrIndex = 0): int
+    {
+        // Normalize day and times to match how meetings are stored
+        $normalizedDay = $this->normalizeDay($day);
+        
+        // Check if preferred room is available
+        if ($preferredRoomId && isset($rooms[$preferredRoomId])) {
+            $room = $rooms[$preferredRoomId];
+            $roomKey = $room['room_id'];
+            $dayKey = $normalizedDay;
+            
+            if (!isset($roomUsage[$roomKey][$dayKey])) {
+                $roomUsage[$roomKey][$dayKey] = [];
+            }
+            
+            $hasConflict = false;
+            foreach ($roomUsage[$roomKey][$dayKey] as $existingSlot) {
+                if ($this->timesOverlap($startTime, $endTime, $existingSlot['start_time'], $existingSlot['end_time'])) {
+                    $hasConflict = true;
+                    break;
+                }
+            }
+            
+            if (!$hasConflict) {
+                $roomUsage[$roomKey][$dayKey][] = [
+                    'start_time' => $startTime,
+                    'end_time' => $endTime
+                ];
+                return $preferredRoomId;
+            }
+        }
+        
+        // Round-robin selection from available rooms
+        $availableRooms = array_filter($rooms, function($room) use ($normalizedDay, $startTime, $endTime, $roomUsage) {
+            $roomKey = $room['room_id'];
+            $dayKey = $normalizedDay;
+            
+            if (!isset($roomUsage[$roomKey][$dayKey])) {
+                return true;
+            }
+            
+            foreach ($roomUsage[$roomKey][$dayKey] as $existingSlot) {
+                if ($this->timesOverlap($startTime, $endTime, $existingSlot['start_time'], $existingSlot['end_time'])) {
+                    return false;
+                }
+            }
+            
+            return true;
+        });
+        
+        if (empty($availableRooms)) {
+            // Fallback to first room if none available
+            return array_values($rooms)[0]['room_id'];
+        }
+        
+        $roomIds = array_keys($availableRooms);
+        $selectedRoomId = $roomIds[$rrIndex % count($roomIds)];
+        $rrIndex++;
+        
+        // Update room usage
+        $roomKey = $selectedRoomId;
+        $dayKey = $normalizedDay;
+        if (!isset($roomUsage[$roomKey][$dayKey])) {
+            $roomUsage[$roomKey][$dayKey] = [];
+        }
+        $roomUsage[$roomKey][$dayKey][] = [
+            'start_time' => $startTime,
+            'end_time' => $endTime
+        ];
+        
+        return $selectedRoomId;
+    }
+
+    private function expandSchedulesToBothBlocks(array $schedules): array
+    {
+        $expandedSchedules = [];
+        
+        foreach ($schedules as $schedule) {
+            // Add original schedule
+            $expandedSchedules[] = $schedule;
+            
+            // Create copy for other block
+            $otherBlockSchedule = $schedule;
+            $otherBlockSchedule['block'] = ($schedule['block'] === 'A') ? 'B' : 'A';
+            
+            // Update section_id for the other block
+            $otherBlockSchedule['section_id'] = $this->resolveSectionId(
+                $schedule['dept'],
+                $schedule['year_level'],
+                $otherBlockSchedule['block']
+            );
+            
+            $expandedSchedules[] = $otherBlockSchedule;
+        }
+        
+        return $expandedSchedules;
+    }
+
+    private function createEntryAndMeeting(int $groupId, int $roomId, string $instructorName, string $subjectCode, string $subjectDescription, int $units, string $day, string $startTime, string $endTime, string $department, string $yearLevel, string $block)
+    {
+        try {
+                $instructorId = $this->resolveInstructorId($instructorName);
+                $subjectId = $this->resolveSubjectId($subjectCode, $subjectDescription, $units);
+            $sectionId = $this->resolveSectionId($department, $yearLevel, $block);
+            
+            // Normalize day to abbreviated format for database
+            $normalizedDay = $this->normalizeDay($day);
+
+            $entry = ScheduleEntry::create([
+                    'group_id' => $groupId,
+                'room_id' => $roomId,
+                    'instructor_id' => $instructorId,
+                    'subject_id' => $subjectId,
+                    'section_id' => $sectionId,
+                'day' => $normalizedDay,
+                'start_time' => $startTime,
+                'end_time' => $endTime,
+                'department' => $department,
+                'year_level' => $yearLevel,
+                'block' => $block,
+                'subject_code' => $subjectCode,
+                'subject_description' => $subjectDescription,
+                'units' => $units,
+                'instructor_name' => $instructorName
+            ]);
+
+            ScheduleMeeting::create([
+                    'entry_id' => $entry->entry_id,
+                    'room_id' => $roomId,
+                'instructor_id' => $instructorId,
+                'day' => $normalizedDay,
+                'start_time' => $startTime,
+                'end_time' => $endTime
+                ]);
+
+                return $entry;
+        } catch (Exception $e) {
+            Log::error("Error creating entry: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    private function normalizeDay(string $day): string
+    {
+        $map = [
+            'monday' => 'Mon',
+            'tuesday' => 'Tue', 
+            'wednesday' => 'Wed',
+            'thursday' => 'Thu',
+            'friday' => 'Fri',
+            'saturday' => 'Sat',
+            'sunday' => 'Sun',
+            'mon' => 'Mon',
+            'tue' => 'Tue',
+            'wed' => 'Wed', 
+            'thu' => 'Thu',
+            'fri' => 'Fri',
+            'sat' => 'Sat',
+            'sun' => 'Sun'
+        ];
+        
+        $key = trim($day);
+        return $map[$key] ?? 'Mon';
+    }
+
+    /**
+     * MAIN SCHEDULER: Generate schedule using Python algorithms
+     * 
+     * ARCHITECTURE:
+     * - Python (OR-Tools/Genetic) = Main scheduler (handles all logic, constraints, conflicts)
+     * - Laravel = Translator only (converts data format, saves to database)
+     * 
+     * Flow: Request → Python Algorithm → Database → Response
+     */
+    public function generateSchedule(Request $request): JsonResponse
+    {
+        // Increase execution time limit for Python algorithms
+        set_time_limit(60);
+        
+        try {
+            $rawInstructorData = $request->input('instructorData', []);
+            $semester = $request->input('semester', '1st Semester');
+            $schoolYear = $request->input('schoolYear', '2024-2025');
+
+            if (empty($rawInstructorData)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No instructor data provided'
+                ], 400);
+            }
+
+            // Transform the raw data array to the expected format
+            $instructorData = $this->transformInstructorData($rawInstructorData);
+            Log::info("Transformed " . count($rawInstructorData) . " raw entries to " . count($instructorData) . " valid entries");
+
+            $department = !empty($instructorData) && isset($instructorData[0]) ? ($instructorData[0]['dept'] ?? 'BSBA') : 'BSBA';
+            
+            // Clear any existing schedule entries for this department/semester/year
+            $existingGroups = ScheduleGroup::where('department', $department)
+                ->where('school_year', $schoolYear)
+                ->where('semester', $semester)
+                ->get();
+            
+            foreach ($existingGroups as $group) {
+                // Delete related schedule entries and meetings first
+                ScheduleEntry::where('group_id', $group->group_id)->delete();
+                $group->delete();
+            }
+            
+            $scheduleGroup = ScheduleGroup::create([
+                'department' => $department,
+                'school_year' => $schoolYear,
+                'semester' => $semester
+            ]);
+
+            // Proactively ensure both A and B sections exist for every year level present in the data
+            $yearLevels = array_unique(array_column($instructorData, 'yearLevel'));
+            foreach ($yearLevels as $yearLevel) {
+                $this->resolveSectionId($department, $yearLevel, 'A');
+                $this->resolveSectionId($department, $yearLevel, 'B');
+            }
+
+            // Build rooms list for Python with all required fields
+            $rooms = Room::all(['room_id','room_name','capacity','is_lab','is_active'])->map(function ($r) {
+                return [
+                    'room_id' => $r->room_id,
+                    'room_name' => $r->room_name,
+                    'capacity' => $r->capacity ?? 30, // Default capacity if null
+                    'is_lab' => $r->is_lab ?? false, // Default to false if null
+                    'is_active' => $r->is_active ?? true, // Default to true if null
+                ];
+            })->values()->toArray();
+            Log::info("Available rooms: " . count($rooms));
+
+            // Try Python OR-Tools Algorithm first
+            Log::info('Starting Python OR-Tools Algorithm with ' . count($instructorData) . ' courses...');
+            $ortoolsResult = ['success' => false, 'message' => 'OR-Tools algorithm not attempted'];
+            try {
+                $ortoolsResult = $this->runOrtoolsAlgorithm($instructorData, $rooms, $scheduleGroup->group_id);
+            } catch (\Throwable $e) {
+                Log::error('OR-Tools algorithm threw exception: ' . $e->getMessage());
+                $ortoolsResult = ['success' => false, 'message' => 'OR-Tools algorithm exception: ' . $e->getMessage()];
+            } catch (\Error $e) {
+                Log::error('OR-Tools algorithm fatal error: ' . $e->getMessage());
+                $ortoolsResult = ['success' => false, 'message' => 'OR-Tools algorithm fatal error: ' . $e->getMessage()];
+            }
+            
+            if ($ortoolsResult['success']) {
+                Log::info('OR-Tools algorithm succeeded with ' . count($ortoolsResult['schedules']) . ' entries');
+                
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Schedule generated using Python OR-Tools algorithm',
+                    'data' => $ortoolsResult,
+                    'group_id' => $scheduleGroup->group_id,
+                    'department' => $department,
+                    'school_year' => $schoolYear,
+                    'semester' => $semester,
+                    'algorithm' => 'ortools'
+                ]);
+            }
+            
+            // Fallback to Python Genetic Algorithm
+            Log::info('OR-Tools failed, trying Python Genetic Algorithm with ' . count($instructorData) . ' courses...');
+            $geneticResult = ['success' => false, 'message' => 'Genetic algorithm not attempted'];
+            try {
+                $geneticResult = $this->runGeneticAlgorithm($instructorData, $rooms, $scheduleGroup->group_id);
+            } catch (\Throwable $e) {
+                Log::error('Genetic algorithm threw exception: ' . $e->getMessage());
+                $geneticResult = ['success' => false, 'message' => 'Genetic algorithm exception: ' . $e->getMessage()];
+            } catch (\Error $e) {
+                Log::error('Genetic algorithm fatal error: ' . $e->getMessage());
+                $geneticResult = ['success' => false, 'message' => 'Genetic algorithm fatal error: ' . $e->getMessage()];
+            }
+            
+            if ($geneticResult['success']) {
+                Log::info('Genetic algorithm succeeded with ' . count($geneticResult['schedules']) . ' entries');
+            
+            return response()->json([
+                'success' => true,
+                    'message' => 'Schedule generated using Python Genetic Algorithm',
+                    'data' => $geneticResult,
+                'group_id' => $scheduleGroup->group_id,
+                'department' => $department,
+                'school_year' => $schoolYear,
+                'semester' => $semester,
+                    'algorithm' => 'genetic'
+                ]);
+            }
+            
+            // If all Python algorithms fail, try PHP fallback
+            Log::info('Both Python algorithms failed, trying PHP fallback algorithm...');
+            $phpResult = $this->runPhpFallbackAlgorithm($instructorData, $rooms, $scheduleGroup->group_id);
+            
+            if ($phpResult['success']) {
+                Log::info('PHP fallback algorithm succeeded with ' . count($phpResult['schedules']) . ' entries');
+                
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Schedule generated using PHP fallback algorithm',
+                    'data' => $phpResult,
+                    'group_id' => $scheduleGroup->group_id,
+                    'department' => $department,
+                    'school_year' => $schoolYear,
+                    'semester' => $semester,
+                    'algorithm' => 'php_fallback'
+                ]);
+            }
+            
+            // If all algorithms fail, return error
+            Log::error('All scheduling algorithms failed.');
+            return response()->json([
+                'success' => false,
+                'message' => 'All scheduling algorithms failed. The problem may be infeasible with current constraints.',
+                'errors' => [
+                    'ortools' => $ortoolsResult['message'] ?? 'Unknown error',
+                    'genetic' => $geneticResult['message'] ?? 'Unknown error',
+                    'php_fallback' => $phpResult['message'] ?? 'Unknown error'
+                ]
+            ], 500);
+
+        } catch (Exception $e) {
+            Log::error('Schedule generation error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Schedule generation failed: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    private function transformInstructorData(array $rawData): array
+    {
+        $transformedData = [];
+        
+        foreach ($rawData as $row) {
+            // Skip empty rows
+            if (empty($row['name']) || empty($row['courseCode'])) {
+                    continue;
+                }
+                
+            // Parse section information
+            $sectionParts = $this->parseSectionParts($row['section'] ?? '');
+            $yearLevel = $sectionParts[0] ?: '1st Year';
+            $block = $sectionParts[1] ?: 'A';
+                
+                $transformedData[] = [
+                'name' => trim($row['name']),
+                'courseCode' => trim($row['courseCode']),
+                'subject' => trim($row['subject'] ?? $row['courseCode']),
+                'unit' => (int) ($row['unit'] ?? 0),
+                'employmentType' => $row['employmentType'] ?? 'Full-time',
+                'sessionType' => $row['sessionType'] ?? 'Non-Lab session',
+                'dept' => $row['dept'] ?? 'BSBA',
+                'yearLevel' => $yearLevel,
+                'block' => $block,
+                'section' => trim($row['section'] ?? '')
+            ];
+        }
+        
+        return $transformedData;
+    }
+
+    private function synchronizeSubjectsAcrossBlocks(array $instructorData): array
+    {
+        $synchronizedData = [];
+        $processedSubjects = [];
+
+        foreach ($instructorData as $entry) {
+            $key = $entry['courseCode'] . '|' . $entry['yearLevel'];
+            
+            if (!isset($processedSubjects[$key])) {
+                $processedSubjects[$key] = true;
+                
+                // Create entries for both A and B blocks
+                $entryA = $entry;
+                $entryA['block'] = 'A';
+                $entryA['section'] = $entryA['yearLevel'] . ' A';
+                
+                $entryB = $entry;
+                $entryB['block'] = 'B';
+                $entryB['section'] = $entryB['yearLevel'] . ' B';
+                
+                $synchronizedData[] = $entryA;
+                $synchronizedData[] = $entryB;
+            }
+        }
+
+        return $synchronizedData;
+    }
+
+    /**
+     * TRANSLATOR: Call Python OR-Tools Algorithm
+     * Laravel only translates data and saves results - Python does all scheduling logic
+     */
+    private function runOrtoolsAlgorithm(array $instructorData, array $rooms, int $groupId): array
+    {
+        try {
+            Log::info("Starting OR-Tools algorithm...");
+            $roomUsage = [];
+            $roomDayUsage = [];
+            $rrIndex = 0; // round-robin pointer to spread when multiple rooms are free
+
+            // Build quick lookup for session type per course+instructor
+            $sessionTypeByKey = [];
+            $labCount = 0; $nonLabCount = 0;
+            foreach ($instructorData as $row) {
+                $key = strtoupper(trim(($row['courseCode'] ?? '') . '|' . ($row['subject'] ?? '') . '|' . ($row['name'] ?? '')));
+                $st = $row['sessionType'] ?? 'Non-Lab session';
+                $sessionTypeByKey[$key] = $st;
+                if (strcasecmp($st, 'Lab session') === 0) { $labCount++; } else { $nonLabCount++; }
+            }
+            \Log::info('SessionType distribution (ORT)', ['lab' => $labCount, 'non_lab' => $nonLabCount]);
+            
+            $payload = [
+                'instructorData' => $instructorData,
+                'rooms' => $rooms,
+                'timeLimitSec' => 45, // Increased timeout for complex problems
+            ];
+
+            // Invoke Python OR-Tools script
+            $python = base_path('venv/Scripts/python.exe');
+            if (!file_exists($python)) {
+                $python = 'python';
+            }
+
+            // Run as module to support package-relative imports
+            $process = new \Symfony\Component\Process\Process([$python, '-m', 'PythonAlgo.Scheduler']);
+            $process->setInput(json_encode($payload));
+            $process->setTimeout(30); // Reduced to 30 seconds to prevent fatal errors
+            $process->setWorkingDirectory(base_path()); // Run from project root
+            $process->run();
+
+            if (!$process->isSuccessful()) {
+                $errorOutput = $process->getErrorOutput();
+                $exitCode = $process->getExitCode();
+                Log::warning("OR-Tools process failed with exit code {$exitCode}: {$errorOutput}");
+                return ['success' => false, 'message' => "OR-Tools process failed: {$errorOutput}"];
+            }
+
+            $output = json_decode($process->getOutput(), true);
+            if (!is_array($output) || !$output['success']) {
+                Log::warning('OR-Tools returned failure: ' . json_encode($output));
+                return ['success' => false, 'message' => 'OR-Tools failed to find solution'];
+            }
+
+            // Process the OR-Tools results
+            $schedules = $output['schedules'] ?? [];
+            // Expand any A & B markers to both blocks defensively
+            $schedules = $this->expandSchedulesToBothBlocks($schedules);
+            $errors = $output['errors'] ?? [];
+
+            Log::info("OR-Tools completed with " . count($schedules) . " schedules");
+            Log::info("Errors: " . json_encode($errors));
+
+            // Save schedules to database
+            $savedSchedules = [];
+            foreach ($schedules as $schedule) {
+                // Normalize potential combined section for OR-Tools path as well
+                $deptForSection = $schedule['dept'] ?? 'General';
+                $sectionRaw = $schedule['section'] ?? '';
+                [$parsedYear, $parsedBlock] = $this->parseSectionParts($sectionRaw);
+                $yearLevelOut = $schedule['year_level'] ?? $parsedYear;
+                $blockOut = $schedule['block'] ?? $parsedBlock;
+                if ($yearLevelOut === '' && !empty($schedule['subject_code'])) {
+                    $yearLevelOut = $this->determineYearLevel($schedule['subject_code']);
+                }
+                
+                $entry = $this->createEntryAndMeeting(
+                    $groupId,
+                    $schedule['room_id'],
+                    $schedule['instructor'],
+                    $schedule['subject_code'],
+                    $schedule['subject_description'],
+                    $schedule['unit'],
+                    $schedule['day'],
+                    $schedule['start_time'],
+                    $schedule['end_time'],
+                    $deptForSection,
+                    $yearLevelOut,
+                    $blockOut
+                );
+                
+                if ($entry) {
+                    $savedSchedules[] = $entry;
+                }
+            }
+
+            return [
+                'success' => true,
+                'schedules' => $savedSchedules,
+                'errors' => $errors,
+                'algorithm' => 'ortools'
+            ];
+
+        } catch (\Throwable $e) {
+            Log::error('OR-Tools algorithm error: ' . $e->getMessage());
+            return ['success' => false, 'message' => 'OR-Tools algorithm error: ' . $e->getMessage()];
+        }
+    }
+
+    /**
+     * TRANSLATOR: Call Python Genetic Algorithm
+     * Laravel only translates data and saves results - Python does all scheduling logic
+     */
+    private function runGeneticAlgorithm(array $instructorData, array $rooms, int $groupId): array
+    {
+        try {
+            Log::info("Starting genetic algorithm...");
+            $roomUsage = [];
+            $roomDayUsage = [];
+            $rrIndex = 0; // round-robin pointer to spread when multiple rooms are free
+
+            // Build quick lookup for session type per course+instructor
+            $sessionTypeByKey = [];
+            $labCount = 0; $nonLabCount = 0;
+            foreach ($instructorData as $row) {
+                $key = strtoupper(trim(($row['courseCode'] ?? '') . '|' . ($row['subject'] ?? '') . '|' . ($row['name'] ?? '')));
+                $st = $row['sessionType'] ?? 'Non-Lab session';
+                $sessionTypeByKey[$key] = $st;
+                if (strcasecmp($st, 'Lab session') === 0) { $labCount++; } else { $nonLabCount++; }
+            }
+            \Log::info('SessionType distribution (GA)', ['lab' => $labCount, 'non_lab' => $nonLabCount]);
+            
+            $payload = [
+                'instructorData' => $instructorData,
+                'rooms' => $rooms,
+                'timeLimitSec' => 45, // Increased timeout for complex problems
+            ];
+
+            // Invoke Python genetic algorithm script
+            $python = base_path('venv/Scripts/python.exe');
+            if (!file_exists($python)) {
+                $python = 'python';
+            }
+
+            // Run as module to support package-relative imports
+            $process = new \Symfony\Component\Process\Process([$python, '-m', 'PythonAlgo.GeneticScheduler']);
+            $process->setInput(json_encode($payload));
+            $process->setTimeout(30); // Reduced to 30 seconds to prevent fatal errors
+            $process->setWorkingDirectory(base_path()); // Run from project root
+            $process->run();
+
+            if (!$process->isSuccessful()) {
+                $errorOutput = $process->getErrorOutput();
+                $exitCode = $process->getExitCode();
+                Log::warning("Genetic algorithm process failed with exit code {$exitCode}: {$errorOutput}");
+                
+                // Check if it's a timeout error
+                if (strpos($errorOutput, 'timeout') !== false || strpos($errorOutput, 'Maximum execution time') !== false) {
+                    return ['success' => false, 'message' => "Genetic algorithm timed out after 60 seconds"];
+                }
+                
+                return ['success' => false, 'message' => "Genetic algorithm failed: {$errorOutput}"];
+            }
+
+            $output = json_decode($process->getOutput(), true);
+            if (!is_array($output)) {
+                Log::warning('Genetic algorithm returned invalid JSON: ' . $process->getOutput());
+                return ['success' => false, 'message' => 'Genetic algorithm returned invalid response'];
+            }
+            
+            if (!$output || !isset($output['success']) || !$output['success']) {
+                Log::error('Genetic algorithm failed: ' . ($output['message'] ?? 'Unknown error'));
+                return ['success' => false, 'message' => 'Genetic algorithm failed: ' . ($output['message'] ?? 'Unknown error')];
+            }
+
+            // Process the Genetic algorithm results
+            $schedules = $output['schedules'] ?? [];
+            // Expand any A & B markers to both blocks defensively
+            $schedules = $this->expandSchedulesToBothBlocks($schedules);
+            $errors = $output['errors'] ?? [];
+
+            Log::info("Genetic algorithm completed with " . count($schedules) . " schedules");
+            Log::info("Errors: " . json_encode($errors));
+
+            // Save schedules to database
+            $savedSchedules = [];
+            foreach ($schedules as $schedule) {
+                // Normalize potential combined section for Genetic path as well
+                $deptForSection = $schedule['dept'] ?? 'General';
+                $sectionRaw = $schedule['section'] ?? '';
+                [$parsedYear, $parsedBlock] = $this->parseSectionParts($sectionRaw);
+                $yearLevelOut = $schedule['year_level'] ?? $parsedYear;
+                $blockOut = $schedule['block'] ?? $parsedBlock;
+                if ($yearLevelOut === '' && !empty($schedule['subject_code'])) {
+                    $yearLevelOut = $this->determineYearLevel($schedule['subject_code']);
+                }
+
+                $entry = $this->createEntryAndMeeting(
+                    $groupId,
+                    $schedule['room_id'],
+                    $schedule['instructor'],
+                    $schedule['subject_code'],
+                    $schedule['subject_description'],
+                    $schedule['unit'],
+                    $schedule['day'],
+                    $schedule['start_time'],
+                    $schedule['end_time'],
+                    $deptForSection,
+                    $yearLevelOut,
+                    $blockOut
+                );
+
+                if ($entry) {
+                    $savedSchedules[] = $entry;
+                }
+            }
+
+            return [
+                'success' => true,
+                'schedules' => $savedSchedules,
+                'errors' => $errors,
+                'algorithm' => 'genetic'
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('Genetic algorithm error: ' . $e->getMessage());
+            return ['success' => false, 'message' => 'Genetic algorithm error: ' . $e->getMessage()];
+        }
+    }
+
+    private function detectScheduleOverlaps(array $schedules): array
+    {
+        $overlaps = [];
+        
+        for ($i = 0; $i < count($schedules); $i++) {
+            for ($j = $i + 1; $j < count($schedules); $j++) {
+                $schedule1 = $schedules[$i];
+                $schedule2 = $schedules[$j];
+                
+                // Check if same instructor, same day, overlapping times
+                if ($schedule1['instructor_name'] === $schedule2['instructor_name'] &&
+                    $schedule1['day'] === $schedule2['day'] &&
+                    $this->timesOverlap($schedule1['start_time'], $schedule1['end_time'], 
+                                      $schedule2['start_time'], $schedule2['end_time'])) {
+                    $overlaps[] = [
+                        'schedule1' => $schedule1,
+                        'schedule2' => $schedule2,
+                        'type' => 'instructor_conflict'
+                    ];
+                }
+                
+                // Check if same room, same day, overlapping times
+                if ($schedule1['room_id'] === $schedule2['room_id'] &&
+                    $schedule1['day'] === $schedule2['day'] &&
+                    $this->timesOverlap($schedule1['start_time'], $schedule1['end_time'], 
+                                      $schedule2['start_time'], $schedule2['end_time'])) {
+                    $overlaps[] = [
+                        'schedule1' => $schedule1,
+                        'schedule2' => $schedule2,
+                        'type' => 'room_conflict'
+                    ];
+                }
+            }
+        }
+        
+        return $overlaps;
+    }
+
+    private function timesOverlap(string $start1, string $end1, string $start2, string $end2): bool
+    {
+        $start1Time = strtotime($start1);
+        $end1Time = strtotime($end1);
+        $start2Time = strtotime($start2);
+        $end2Time = strtotime($end2);
+        
+        return ($start1Time < $end2Time) && ($start2Time < $end1Time);
+    }
+
+    public function getSchedules(Request $request): JsonResponse
+    {
+        try {
+            $groupId = $request->input('group_id');
+            $department = $request->input('department');
+            $semester = $request->input('semester');
+            $schoolYear = $request->input('school_year');
+
+            $query = ScheduleEntry::with(['instructor', 'subject', 'section', 'room']);
+
+            if ($groupId) {
+                $query->where('group_id', $groupId);
+            }
+
+            if ($department) {
+                $query->where('department', $department);
+            }
+
+            if ($semester) {
+                $query->whereHas('scheduleGroup', function($q) use ($semester) {
+                    $q->where('semester', $semester);
+                });
+            }
+
+            if ($schoolYear) {
+                $query->whereHas('scheduleGroup', function($q) use ($schoolYear) {
+                    $q->where('school_year', $schoolYear);
+                });
+            }
+
+            $schedules = $query->get();
+
+            // Consolidate course entries
+            $consolidatedSchedules = $this->consolidateCourseEntries($schedules);
+
+            return response()->json([
+                'success' => true,
+                'data' => $consolidatedSchedules,
+                'total' => count($consolidatedSchedules)
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Get schedules error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to retrieve schedules: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    private function consolidateCourseEntries($courseEntries)
+    {
+        $grouped = $courseEntries->groupBy(function($entry) {
+            return $entry->subject_code . '|' . $entry->year_level . '|' . $entry->block;
+        });
+
+        $consolidated = [];
+        foreach ($grouped as $key => $entries) {
+            $consolidated[] = $this->createContinuousTimeRange($entries);
+        }
+
+        return $consolidated;
+    }
+
+    private function createContinuousTimeRange($courseEntries)
+    {
+        $firstEntry = $courseEntries->first();
+        
+        $days = $courseEntries->pluck('day')->unique()->sort()->values()->toArray();
+        $combinedDays = $this->combineDays($days);
+        
+        $timeRange = $this->formatTimeForDisplay($firstEntry->start_time) . '–' . 
+                    $this->formatTimeForDisplay($firstEntry->end_time);
+        
+        $primaryRoom = $this->selectPrimaryRoom($courseEntries);
+
+        return [
+            'subject_code' => $firstEntry->subject_code,
+            'subject_description' => $firstEntry->subject_description,
+            'instructor_name' => $firstEntry->instructor_name,
+            'year_level' => $firstEntry->year_level,
+            'block' => $firstEntry->block,
+            'days' => $combinedDays,
+            'time_range' => $timeRange,
+            'room_name' => $primaryRoom ? $primaryRoom->room_name : 'TBA',
+            'units' => $firstEntry->units,
+            'department' => $firstEntry->department
+        ];
+    }
+
+    private function selectPrimaryRoom($courseEntries)
+    {
+        $roomCounts = $courseEntries->countBy('room_id');
+        $mostUsedRoomId = $roomCounts->sortDesc()->keys()->first();
+        
+        return $courseEntries->firstWhere('room_id', $mostUsedRoomId)->room ?? null;
+    }
+
+    public function testTimeFormats(): JsonResponse
+    {
+        $testTimes = [
+            '08:00:00',
+            '12:00:00', 
+            '17:00:00',
+            '20:00:00'
+        ];
+
+        $results = [];
+        foreach ($testTimes as $time) {
+            $results[] = [
+                '24hour' => $time,
+                '12hour' => $this->convertTo12Hour($time),
+                'display' => $this->formatTimeForDisplay($time)
+            ];
+        }
+
+        return response()->json($results);
+    }
+
+    public function testDatabase(): JsonResponse
+    {
+        try {
+            $instructors = Instructor::count();
+            $subjects = Subject::count();
+            $sections = Section::count();
+            $rooms = Room::count();
+            $scheduleEntries = ScheduleEntry::count();
+            
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'instructors' => $instructors,
+                    'subjects' => $subjects,
+                    'sections' => $sections,
+                    'rooms' => $rooms,
+                    'schedule_entries' => $scheduleEntries
+                ]
+            ]);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function debugData(Request $request): JsonResponse
+    {
+        try {
+            $rawData = $request->input('data', []);
+            
+            $transformed = $this->transformInstructorData($rawData);
+            $synchronized = $this->synchronizeSubjectsAcrossBlocks($transformed);
+            
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'original_count' => count($rawData),
+                    'transformed_count' => count($transformed),
+                    'synchronized_count' => count($synchronized),
+                    'transformed' => $transformed,
+                    'synchronized' => $synchronized
+                ]
+            ]);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    private function combineDays($days): string
+    {
+        $dayMap = [
+            'Mon' => 'Mon',
+            'Tue' => 'Tue', 
+            'Wed' => 'Wed',
+            'Thu' => 'Thu',
+            'Fri' => 'Fri',
+            'Sat' => 'Sat',
+            'Sun' => 'Sun'
+        ];
+        
+        $normalizedDays = [];
+        foreach ($days as $day) {
+            $normalized = $dayMap[$day] ?? $day;
+            if (!in_array($normalized, $normalizedDays)) {
+                $normalizedDays[] = $normalized;
+            }
+        }
+        
+        return implode('', $normalizedDays);
+    }
+
+    private function formatTimeForDisplay($time): string
+    {
+        if (empty($time)) {
+            return 'TBA';
+        }
+        
+        // Handle both 24-hour and 12-hour formats
+        if (strpos($time, 'AM') !== false || strpos($time, 'PM') !== false) {
+            return $time; // Already in 12-hour format
+        }
+        
+        // Convert 24-hour to 12-hour
+        return $this->convertTo12Hour($time);
+    }
+
+    private function convertTo12Hour(string $time24Hour): string
+    {
+        $time = DateTime::createFromFormat('H:i:s', $time24Hour);
+        if (!$time) {
+            $time = DateTime::createFromFormat('H:i', $time24Hour);
+        }
+        
+        if (!$time) {
+            return 'TBA';
+        }
+        
+        return $time->format('g:i A');
+    }
+
+    public function getScheduleByGroupId(Request $request): JsonResponse
+    {
+        try {
+            $groupId = $request->input('group_id');
+            
+            if (!$groupId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Group ID is required'
+                ], 400);
+            }
+
+            $schedules = ScheduleEntry::with(['instructor', 'subject', 'section', 'room'])
+                ->where('group_id', $groupId)
+                ->get();
+
+            $consolidatedSchedules = $this->consolidateCourseEntries($schedules);
+
+            return response()->json([
+                'success' => true,
+                'data' => $consolidatedSchedules,
+                'total' => count($consolidatedSchedules),
+                'group_id' => $groupId
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Get schedule by group ID error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to retrieve schedule: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    private function determineYearLevel(string $courseCode): string
+    {
+        // Extract numbers from course code to determine year level
+        if (preg_match('/(\d+)/', $courseCode, $matches)) {
+            $number = (int) $matches[1];
+            if ($number <= 100) return '1st Year';
+            if ($number <= 200) return '2nd Year';
+            if ($number <= 300) return '3rd Year';
+            if ($number <= 400) return '4th Year';
+        }
+        
+        // Default based on course code patterns
+        if (strpos($courseCode, 'GE') !== false) return '1st Year';
+        if (strpos($courseCode, 'PE') !== false) return '1st Year';
+        if (strpos($courseCode, 'PROF') !== false) return '3rd Year';
+        if (strpos($courseCode, 'EL') !== false) return '2nd Year';
+        if (strpos($courseCode, 'SCI') !== false) return '3rd Year';
+        if (strpos($courseCode, 'IELP') !== false) return '1st Year';
+        
+        return '1st Year'; // Default
+    }
+
+    private function validateSubjectConsistency(array $instructorData): array
+    {
+        $issues = [];
+        $subjectGroups = [];
+        
+        // Group by subject code and year level
+        foreach ($instructorData as $entry) {
+            $key = $entry['courseCode'] . '|' . $entry['yearLevel'];
+            if (!isset($subjectGroups[$key])) {
+                $subjectGroups[$key] = [];
+            }
+            $subjectGroups[$key][] = $entry;
+        }
+        
+        // Check each group for consistency
+        foreach ($subjectGroups as $key => $entries) {
+            $blocks = array_unique(array_column($entries, 'block'));
+            $units = array_unique(array_column($entries, 'unit'));
+            $instructors = array_unique(array_column($entries, 'name'));
+            
+            if (count($blocks) < 2) {
+                $issues[] = [
+                    'type' => 'missing_block',
+                    'subject' => $key,
+                    'message' => "Subject {$key} only appears in block(s): " . implode(', ', $blocks)
+                ];
+            }
+            
+            if (count($units) > 1) {
+                        $issues[] = [
+                    'type' => 'unit_mismatch',
+                    'subject' => $key,
+                    'message' => "Subject {$key} has inconsistent units: " . implode(', ', $units)
+                ];
+            }
+        }
+        
+        return $issues;
+    }
+
+    public function debugSubjectConsistency(Request $request): JsonResponse
+    {
+        try {
+            $rawData = $request->input('data', []);
+            $transformed = $this->transformInstructorData($rawData);
+            $issues = $this->validateSubjectConsistency($transformed);
+            
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'total_entries' => count($transformed),
+                    'issues' => $issues,
+                    'issue_count' => count($issues)
+                ]
+            ]);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Simple PHP fallback algorithm when Python algorithms fail
+     */
+    private function runPhpFallbackAlgorithm(array $instructorData, array $rooms, int $groupId): array
+    {
+        try {
+            Log::info("Starting PHP fallback algorithm...");
+            
+            // Synchronize subjects across blocks to ensure both A and B sections are created
+            $synchronizedData = $this->synchronizeSubjectsAcrossBlocks($instructorData);
+            Log::info("Synchronized data: " . count($synchronizedData) . " entries (original: " . count($instructorData) . ")");
+            
+            $startTime = time();
+            $maxExecutionTime = 45; // 45 seconds max for PHP fallback to process all courses
+            
+            $schedules = [];
+            $usedSlots = [];
+            $usedRooms = [];
+            $usedCombinations = []; // Track unique combinations to prevent duplicates
+            
+            // Comprehensive time slots for better scheduling coverage
+            $timeSlots = [
+                ['day' => 'Monday', 'start' => '07:30:00', 'end' => '09:00:00'],
+                ['day' => 'Monday', 'start' => '09:00:00', 'end' => '10:30:00'],
+                ['day' => 'Monday', 'start' => '10:30:00', 'end' => '12:00:00'],
+                ['day' => 'Monday', 'start' => '13:00:00', 'end' => '14:30:00'],
+                ['day' => 'Monday', 'start' => '14:30:00', 'end' => '16:00:00'],
+                ['day' => 'Tuesday', 'start' => '07:30:00', 'end' => '09:00:00'],
+                ['day' => 'Tuesday', 'start' => '09:00:00', 'end' => '10:30:00'],
+                ['day' => 'Tuesday', 'start' => '10:30:00', 'end' => '12:00:00'],
+                ['day' => 'Tuesday', 'start' => '13:00:00', 'end' => '14:30:00'],
+                ['day' => 'Tuesday', 'start' => '14:30:00', 'end' => '16:00:00'],
+                ['day' => 'Wednesday', 'start' => '07:30:00', 'end' => '09:00:00'],
+                ['day' => 'Wednesday', 'start' => '09:00:00', 'end' => '10:30:00'],
+                ['day' => 'Wednesday', 'start' => '10:30:00', 'end' => '12:00:00'],
+                ['day' => 'Wednesday', 'start' => '13:00:00', 'end' => '14:30:00'],
+                ['day' => 'Wednesday', 'start' => '14:30:00', 'end' => '16:00:00'],
+                ['day' => 'Thursday', 'start' => '07:30:00', 'end' => '09:00:00'],
+                ['day' => 'Thursday', 'start' => '09:00:00', 'end' => '10:30:00'],
+                ['day' => 'Thursday', 'start' => '10:30:00', 'end' => '12:00:00'],
+                ['day' => 'Thursday', 'start' => '13:00:00', 'end' => '14:30:00'],
+                ['day' => 'Thursday', 'start' => '14:30:00', 'end' => '16:00:00'],
+                ['day' => 'Friday', 'start' => '07:30:00', 'end' => '09:00:00'],
+                ['day' => 'Friday', 'start' => '09:00:00', 'end' => '10:30:00'],
+                ['day' => 'Friday', 'start' => '10:30:00', 'end' => '12:00:00'],
+                ['day' => 'Friday', 'start' => '13:00:00', 'end' => '14:30:00'],
+                ['day' => 'Friday', 'start' => '14:30:00', 'end' => '16:00:00'],
+            ];
+            
+            // Process ALL synchronized courses but with timeout protection
+            Log::info("Processing " . count($synchronizedData) . " total courses (synchronized)");
+            
+            foreach ($synchronizedData as $courseIndex => $course) {
+                // Check timeout
+                if (time() - $startTime > $maxExecutionTime) {
+                    Log::warning("PHP fallback algorithm timeout reached at course {$courseIndex}");
+                    return [
+                        'success' => false,
+                        'message' => 'PHP fallback algorithm timeout reached',
+                        'schedules' => $schedules,
+                        'total_entries' => count($schedules)
+                    ];
+                }
+                
+                $units = intval($course['unit'] ?? 3);
+                
+                Log::info("Processing course {$courseIndex}: {$course['courseCode']} - {$course['subject']} ({$units} units) for {$course['name']} in {$course['yearLevel']} {$course['block']}");
+                
+                // Create unique key based on database constraint: group_id, subject_id, instructor_id, section_id
+                $uniqueKey = $groupId . '|' . $course['courseCode'] . '|' . $course['name'] . '|' . ($course['yearLevel'] ?? '1st Year') . ($course['block'] ?? 'A');
+                
+                if (in_array($uniqueKey, $usedCombinations)) {
+                    Log::info("Skipping course {$course['courseCode']} - already processed");
+                    continue;
+                }
+                
+                $assigned = false;
+                
+                // Try to find an available slot and room for this course
+                foreach ($timeSlots as $slot) {
+                    $slotKey = $slot['day'] . '|' . $slot['start'] . '|' . $slot['end'];
+                    
+                    if (in_array($slotKey, $usedSlots)) {
+                        continue;
+                    }
+                    
+                    foreach ($rooms as $room) {
+                        $roomKey = $room['room_id'] . '|' . $slotKey;
+                        
+                        if (in_array($roomKey, $usedRooms)) {
+                            continue;
+                        }
+                        
+                        try {
+                            // Create schedule entry (one per course)
+                            $entry = $this->createEntryAndMeeting(
+                                $groupId,
+                                $room['room_id'],
+                                $course['name'],
+                                $course['courseCode'],
+                                $course['subject'],
+                                $units,
+                                $slot['day'],
+                                $slot['start'],
+                                $slot['end'],
+                                $course['dept'] ?? 'General',
+                                $course['yearLevel'] ?? '1st Year',
+                                $course['block'] ?? 'A'
+                            );
+                            
+                            if ($entry) {
+                                $schedules[] = $entry;
+                                $usedSlots[] = $slotKey;
+                                $usedRooms[] = $roomKey;
+                                $usedCombinations[] = $uniqueKey; // Track unique combinations
+                                $assigned = true;
+                                Log::info("Successfully assigned: {$course['courseCode']} to {$slot['day']} {$slot['start']}-{$slot['end']} in room {$room['room_id']}");
+                                break 2;
+                            }
+                        } catch (\Exception $e) {
+                            if (strpos($e->getMessage(), 'Duplicate entry') !== false) {
+                                Log::info("Skipping duplicate entry for {$course['courseCode']} - already exists");
+                                $usedCombinations[] = $uniqueKey; // Mark as used to prevent retry
+                                continue;
+                            } else {
+                                Log::warning("Failed to create entry for {$course['courseCode']}: " . $e->getMessage());
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                if (!$assigned) {
+                    Log::warning("Could not assign course {$course['courseCode']}");
+                }
+            }
+            
+            $processedCourses = count($schedules);
+            $totalCourses = count($synchronizedData);
+            $originalCourses = count($instructorData);
+            $successRate = $totalCourses > 0 ? round(($processedCourses / $totalCourses) * 100, 1) : 0;
+            
+            // Check for overlaps in the generated schedule
+            $overlaps = $this->detectScheduleOverlaps($schedules);
+            if (!empty($overlaps)) {
+                Log::warning("Found " . count($overlaps) . " schedule overlaps:");
+                foreach ($overlaps as $overlap) {
+                    $schedule1 = $overlap['schedule1'];
+                    $schedule2 = $overlap['schedule2'];
+                    Log::warning("Overlap: {$schedule1['instructor_name']} - {$schedule1['subject_code']} conflicts with {$schedule2['subject_code']} on {$schedule1['day']} {$schedule1['start_time']}-{$schedule1['end_time']}");
+                }
+            }
+            
+            Log::info("PHP fallback completed: {$processedCourses}/{$totalCourses} courses scheduled ({$successRate}% success rate)");
+            Log::info("Original courses: {$originalCourses}, Synchronized courses: {$totalCourses}, Processed: {$processedCourses}");
+            
+            return [
+                'success' => true,
+                'message' => "PHP fallback algorithm completed: {$processedCourses}/{$totalCourses} courses scheduled ({$successRate}% success rate) - Both A and B sections included",
+                'schedules' => $schedules,
+                'total_entries' => count($schedules),
+                'processed_courses' => $processedCourses,
+                'total_courses' => $totalCourses,
+                'original_courses' => $originalCourses,
+                'success_rate' => $successRate,
+                'algorithm' => 'php_fallback'
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('PHP fallback algorithm error: ' . $e->getMessage());
+            return ['success' => false, 'message' => 'PHP fallback algorithm error: ' . $e->getMessage()];
+        }
+    }
+}
